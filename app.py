@@ -1033,13 +1033,13 @@ async def create_draft(request: Request) -> dict:
     except DraftError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    session = sessions.get_or_create(raw_session_id)
+    session = get_or_create(raw_session_id)
     session["objective"] = objective
     session["jurisdiction_state"] = jurisdiction_state
     session["court"] = court
     session["language"] = language
     session["model"] = model
-    sessions.add_event(
+    add_event(
         session,
         "draft",
         0,
@@ -1075,7 +1075,7 @@ async def adversary_round(request: Request) -> dict:
     court = _require_str(body, "court")
     model = _optional_str(body, "model")
 
-    session = sessions.get_or_create(session_id)
+    session = get_or_create(session_id)
     next_round = session["round"] + 1
     if next_round > MAX_ADVERSARY_ROUNDS:
         raise HTTPException(
@@ -1096,7 +1096,7 @@ async def adversary_round(request: Request) -> dict:
     session["jurisdiction_state"] = jurisdiction_state
     session["court"] = court
     session["model"] = model
-    sessions.add_event(
+    add_event(
         session,
         "attack",
         next_round,
@@ -1135,7 +1135,7 @@ async def adversary_harden(request: Request) -> dict:
             "(use the 'attack' object from an /adversary/round response).",
         )
 
-    session = sessions.get_or_create(session_id)
+    session = get_or_create(session_id)
     if session["round"] < 1:
         raise HTTPException(
             status_code=400,
@@ -1148,7 +1148,7 @@ async def adversary_harden(request: Request) -> dict:
     except AdversaryError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    sessions.add_event(
+    add_event(
         session,
         "harden",
         session["round"],
