@@ -209,7 +209,7 @@ CREDENTIAL_NAME = "custom.anthropic"
 ALLOWED_HOSTS = ["api.anthropic.com"]
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TIMEOUT = 180
 
@@ -345,6 +345,462 @@ def parse_json_response(raw: str, required_keys: tuple[str, ...], what: str) -> 
     return payload
 
 # ============================================================
+# module: lang.py (flattened)
+# ============================================================
+"""Output-language support for the ProSe Pro API.
+
+The client sends a language code with every AI call; the prompts then
+instruct the model to respond fully in that language. The launch set is
+fixed (the owner's Nov 24, 2026 language list). Unknown or missing codes
+fall back to English so older clients keep working unchanged.
+
+The not-a-lawyer disclaimer is part of every API response; the strings
+below are careful human-grade translations of the canonical English
+line, one per launch language — never machine-generated at runtime.
+"""
+
+# code -> (English name used in prompts, prompt-facing instruction name)
+LANGUAGES: dict[str, str] = {
+    "en": "English",
+    "es": "Spanish",
+    "tl": "Tagalog",
+    "zh": "Mandarin Chinese (Simplified Chinese)",
+    "vi": "Vietnamese",
+    "ar": "Arabic",
+    "fr": "French",
+    "ko": "Korean",
+    "ru": "Russian",
+    "pt": "Portuguese",
+}
+
+# Canonical disclaimer, carefully translated per launch language.
+DISCLAIMERS: dict[str, str] = {
+    "en": "General legal information only — not legal advice. Consult a licensed attorney.",
+    "es": "Solo información legal general — no es asesoramiento legal. Consulte a un abogado con licencia.",
+    "tl": "Pangkalahatang impormasyong legal lamang — hindi ito payong legal. Kumonsulta sa isang lisensyadong abogado.",
+    "zh": "仅供一般法律信息参考 — 不构成法律建议。请咨询持牌律师。",
+    "vi": "Chỉ là thông tin pháp lý chung — không phải tư vấn pháp lý. Hãy tham khảo ý kiến của luật sư có giấy phép hành nghề.",
+    "ar": "معلومات قانونية عامة فقط — وليست استشارة قانونية. استشر محاميًا مرخصًا.",
+    "fr": "Informations juridiques générales uniquement — ceci ne constitue pas un avis juridique. Consultez un avocat agréé.",
+    "ko": "일반적인 법률 정보일 뿐 법률 자문이 아닙니다. 자격을 갖춘 변호사와 상담하십시오.",
+    "ru": "Только общая юридическая информация — не является юридической консультацией. Обратитесь к лицензированному адвокату.",
+    "pt": "Apenas informações jurídicas gerais — não constitui aconselhamento jurídico. Consulte um advogado licenciado.",
+}
+
+
+def normalize_language(raw: str | None) -> str:
+    """Map any incoming value to a supported code; default English."""
+    if not raw or not isinstance(raw, str):
+        return "en"
+    code = raw.strip().lower().replace("_", "-")
+    if code in LANGUAGES:
+        return code
+    # Tolerate regional variants like "es-MX" / "pt-BR" / "zh-CN".
+    base = code.split("-", 1)[0]
+    return base if base in LANGUAGES else "en"
+
+
+def language_name(code: str) -> str:
+    return LANGUAGES.get(normalize_language(code), "English")
+
+
+def disclaimer_for(code: str | None) -> str:
+    return DISCLAIMERS[normalize_language(code)]
+
+
+def language_instruction(code: str, *, json_note: bool = True) -> str:
+    """Prompt block instructing the model to answer fully in the language.
+
+    Empty for English (the prompts' native language). Enum/structural
+    values (JSON keys, severity, category, status codes) always stay in
+    English — only human-readable content is localized.
+    """
+    code = normalize_language(code)
+    if code == "en":
+        return ""
+    name = LANGUAGES[code]
+    base = (
+        f"LANGUAGE: Write ALL human-readable content entirely in {name} — "
+        f"every sentence a person will read must be in {name}, including "
+        "any disclaimer line you write out. Keep proper nouns, party "
+        "names, case captions, case numbers, and legal citations exactly "
+        "as they appear in the source material. "
+    )
+    if json_note:
+        base += (
+            "JSON keys stay in English, and any fixed enum values named in "
+            "the output contract (severity, category, status, change_type) "
+            "stay in English exactly as specified."
+        )
+    return base
+
+# ============================================================
+# module: research.py (flattened)
+# ============================================================
+"""Live legal research layer for ProSe Pro.
+
+Retrieves real sources for a query from keyless/public services:
+  - CourtListener search API   -> case law (opinions) with citations.
+    The v4 API requires a (free) account token; when the
+    COURTLISTENER_API_TOKEN env var is set it is sent as an auth header,
+    otherwise this source simply contributes nothing.
+  - Cornell LII Wex            -> legal definitions/encyclopedia entries
+    (the free online stand-in for a law dictionary), fetched by term.
+  - eCFR search API            -> Code of Federal Regulations full text.
+  - Federal Register API       -> federal rules, notices, and actions.
+  - General web fallback       -> DuckDuckGo HTML, then Bing HTML
+    (state legislature sites, court rules, ethics codes, treatises —
+    the broad "on record" tier).
+
+Every fetcher is best-effort: failures return whatever was retrieved
+(possibly nothing) and NEVER raise, so callers fall back to model
+knowledge gracefully. Results carry source, title, citation, URL, and
+a short snippet — sources are cited by name/link; snippets are brief
+search excerpts only, never long reproductions.
+"""
+
+import base64
+import html as _html
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_TIMEOUT = 12
+_MAX_SNIPPET = 400
+
+
+class ResearchError(Exception):
+    """Raised only for caller errors (e.g. empty query)."""
+
+
+def _fetch(url: str, timeout: int = _TIMEOUT) -> str | None:
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            return resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def _fetch_json(url: str, headers: dict | None = None) -> dict | None:
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _clean(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = _html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _result(source: str, title: str, citation: str, url: str, snippet: str) -> dict:
+    return {
+        "source": source,
+        "title": _clean(title)[:200],
+        "citation": _clean(citation)[:200],
+        "url": url,
+        "snippet": _clean(snippet)[:_MAX_SNIPPET],
+    }
+
+
+# ---- Case law: CourtListener API -------------------------------------------
+
+def search_courtlistener(query: str, jurisdiction: str | None = None, limit: int = 5) -> list[dict]:
+    q = query if not jurisdiction else f"{query} {jurisdiction}"
+    url = (
+        "https://www.courtlistener.com/api/rest/v4/search/?"
+        + urllib.parse.urlencode({"q": q, "type": "o"})
+    )
+    headers = {}
+    token = os.environ.get("COURTLISTENER_API_TOKEN")
+    if token:
+        headers["Authorization"] = f"Token {token}"
+    payload = _fetch_json(url, headers=headers)
+    if not payload:
+        return []
+    out: list[dict] = []
+    for item in (payload.get("results") or [])[:limit]:
+        case_name = item.get("caseName") or item.get("case_name") or "Untitled case"
+        cites = item.get("citation") or []
+        citation = ", ".join(cites) if isinstance(cites, list) else str(cites)
+        if not citation:
+            court = item.get("court") or ""
+            date = (item.get("dateFiled") or "")[:4]
+            citation = " ".join(p for p in (court, date) if p)
+        path = item.get("absolute_url") or ""
+        link = (
+            "https://www.courtlistener.com" + path
+            if path.startswith("/")
+            else (path or "https://www.courtlistener.com")
+        )
+        out.append(_result("CourtListener", case_name, citation, link, item.get("snippet") or ""))
+    return out
+
+
+# ---- Definitions: Cornell LII Wex ------------------------------------------
+
+_STOPWORDS = {
+    "the", "a", "an", "of", "for", "in", "on", "to", "and", "or", "what",
+    "is", "are", "how", "does", "do", "under", "law", "legal", "illinois",
+    "indiana", "federal", "state", "court", "rule", "rules",
+}
+
+
+def search_lii(query: str, limit: int = 3) -> list[dict]:
+    """Look up Wex entries on Cornell LII by term slug.
+
+    Wex pages live at law.cornell.edu/wex/<term>; try the full query as a
+    slug first (for short queries), then individual significant words.
+    """
+    words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOPWORDS]
+    candidates: list[str] = []
+    if 1 <= len(words) <= 3:
+        candidates.append("_".join(words))
+    candidates += words[:3]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for slug in candidates:
+        if slug in seen or len(slug) < 3:
+            continue
+        seen.add(slug)
+        url = f"https://www.law.cornell.edu/wex/{slug}"
+        page = _fetch(url)
+        if not page:
+            continue
+        m = re.search(r"<title>(.*?)</title>", page, re.DOTALL)
+        title = _clean(m.group(1)).split("|")[0].strip() if m else slug.replace("_", " ")
+        # First substantive paragraph as the definition excerpt.
+        snippet = ""
+        for p in re.finditer(r"<p[^>]*>(.*?)</p>", page, re.DOTALL):
+            text = _clean(p.group(1))
+            if len(text) >= 60:
+                snippet = text
+                break
+        out.append(
+            _result(
+                "Cornell LII — Wex",
+                f"{title} (Wex definition)",
+                "Wex, Cornell Legal Information Institute",
+                url,
+                snippet,
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ---- Regulations: eCFR ------------------------------------------------------
+
+def search_ecfr(query: str, limit: int = 4) -> list[dict]:
+    url = (
+        "https://www.ecfr.gov/api/search/v1/results?"
+        + urllib.parse.urlencode({"query": query, "per_page": limit, "page": 1})
+    )
+    payload = _fetch_json(url)
+    if not payload:
+        return []
+    out: list[dict] = []
+    for item in (payload.get("results") or [])[:limit]:
+        hier = item.get("hierarchy") or {}
+        heads = item.get("headings") or {}
+        title_no = hier.get("title")
+        section = hier.get("section")
+        part = hier.get("part")
+        if section:
+            citation = f"{title_no} CFR § {section}"
+            link = f"https://www.ecfr.gov/current/title-{title_no}/section-{section}"
+        elif part:
+            citation = f"{title_no} CFR part {part}"
+            link = f"https://www.ecfr.gov/current/title-{title_no}/part-{part}"
+        else:
+            citation = f"Title {title_no} CFR"
+            link = "https://www.ecfr.gov"
+        name = heads.get("section") or heads.get("part") or citation
+        heading = heads.get("title") or ""
+        title = f"{name} — {heading}".strip(" —") if heading else str(name)
+        out.append(_result("eCFR", title, citation, link, item.get("full_text_excerpt") or ""))
+    return out
+
+
+# ---- Federal rules/actions: Federal Register --------------------------------
+
+def search_federal_register(query: str, limit: int = 3) -> list[dict]:
+    params = {
+        "conditions[term]": query,
+        "per_page": limit,
+        "fields[]": ["title", "citation", "html_url", "abstract", "document_number"],
+    }
+    url = "https://www.federalregister.gov/api/v1/documents.json?" + urllib.parse.urlencode(params)
+    payload = _fetch_json(url)
+    if not payload:
+        return []
+    out: list[dict] = []
+    for item in (payload.get("results") or [])[:limit]:
+        out.append(
+            _result(
+                "Federal Register",
+                item.get("title") or "Federal Register document",
+                item.get("citation") or item.get("document_number") or "",
+                item.get("html_url") or "https://www.federalregister.gov",
+                item.get("abstract") or "",
+            )
+        )
+    return out
+
+
+# ---- General web fallback: DuckDuckGo HTML, then Bing HTML ------------------
+
+def _search_ddg(query: str, limit: int) -> list[dict]:
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    page = _fetch(url)
+    if not page:
+        return []
+    out: list[dict] = []
+    pattern = re.compile(
+        r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+        r'class="result__snippet"[^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    for m in pattern.finditer(page):
+        href, title, snippet = _html.unescape(m.group(1)), _clean(m.group(2)), m.group(3)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+        if "uddg" in qs:
+            href = qs["uddg"][0]
+        if not title:
+            continue
+        host = urllib.parse.urlparse(href).netloc
+        out.append(_result(f"Web — {host}" if host else "Web", title, host, href, snippet))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _unwrap_bing(href: str) -> str:
+    href = _html.unescape(href)
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+    u = (qs.get("u") or [""])[0]
+    if u.startswith("a1"):
+        s = u[2:]
+        s += "=" * (-len(s) % 4)
+        try:
+            return base64.urlsafe_b64decode(s).decode("utf-8", "replace")
+        except Exception:
+            return href
+    return href
+
+
+def _search_bing(query: str, limit: int) -> list[dict]:
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query, "count": 10})
+    page = _fetch(url)
+    if not page:
+        return []
+    out: list[dict] = []
+    for chunk in page.split('<li class="b_algo"')[1:]:
+        m = re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', chunk, re.DOTALL)
+        if not m:
+            continue
+        href = _unwrap_bing(m.group(1))
+        title = _clean(m.group(2))
+        host = urllib.parse.urlparse(href).netloc
+        if not title or "bing.com" in host:
+            continue
+        p = re.search(r"<p[^>]*>(.*?)</p>", chunk, re.DOTALL)
+        out.append(
+            _result(
+                f"Web — {host}" if host else "Web",
+                title,
+                host,
+                href,
+                p.group(1) if p else "",
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_web(query: str, jurisdiction: str | None = None, limit: int = 5) -> list[dict]:
+    q = query if not jurisdiction else f"{query} {jurisdiction}"
+    return _search_ddg(q, limit) or _search_bing(q, limit)
+
+
+# ---- Combined research -------------------------------------------------------
+
+def research(query: str, jurisdiction: str | None = None) -> dict:
+    """Run all sources and return a combined, de-duplicated result set."""
+    query = (query or "").strip()
+    if not query:
+        raise ResearchError("A non-empty 'query' is required.")
+    jurisdiction = (jurisdiction or "").strip() or None
+
+    results: list[dict] = []
+    results += search_courtlistener(query, jurisdiction)
+    results += search_lii(query)
+    results += search_ecfr(query)
+    results += search_federal_register(query)
+    results += search_web(query, jurisdiction)
+
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for r in results:
+        if r["url"] in seen:
+            continue
+        seen.add(r["url"])
+        deduped.append(r)
+
+    return {
+        "query": query,
+        "jurisdiction": jurisdiction,
+        "results": deduped,
+        "sources_ok": bool(deduped),
+    }
+
+
+def research_context(query: str, jurisdiction: str | None = None, max_items: int = 6) -> str:
+    """Compact retrieved-context block for injection into AI prompts.
+
+    Returns an empty string when retrieval finds nothing, so prompts fall
+    back to model knowledge unchanged.
+    """
+    try:
+        data = research(query, jurisdiction)
+    except Exception:
+        return ""
+    items = data["results"][:max_items]
+    if not items:
+        return ""
+    lines = [
+        "RETRIEVED RESEARCH (live sources — prefer these over memory when "
+        "they are on point; cite by name/citation only, never quote long "
+        "passages):"
+    ]
+    for r in items:
+        cite = f" [{r['citation']}]" if r["citation"] else ""
+        lines.append(f"- ({r['source']}) {r['title']}{cite} — {r['url']}")
+        if r["snippet"]:
+            lines.append(f"  {r['snippet']}")
+    return "\n".join(lines)
+
+# ============================================================
 # module: analysis.py (flattened)
 # ============================================================
 """AI analysis of extracted document text.
@@ -387,8 +843,14 @@ class AnalysisError(Exception):
     """Raised when the analysis step fails (safe to surface as HTTP 502)."""
 
 
-def build_prompt(document_text: str) -> str:
+def build_prompt(
+    document_text: str, research_context: str = "", language: str = "en"
+) -> str:
+    research_block = f"\n\n{research_context}\n" if research_context else ""
+    lang_block = language_instruction(language)
+    lang_prefix = f"{lang_block}\n\n" if lang_block else ""
     return (
+        f"{lang_prefix}"
         "You are a legal-document analyst assistant. You provide GENERAL "
         "LEGAL INFORMATION ONLY — you are not a lawyer, this is not legal "
         "advice, and no attorney-client relationship is created.\n\n"
@@ -404,6 +866,7 @@ def build_prompt(document_text: str) -> str:
         "concise.\n\n"
         "DOCUMENT:\n"
         f"{document_text}"
+        f"{research_block}"
     )
 
 
@@ -432,13 +895,22 @@ def _validate_payload(payload: dict) -> dict:
     return {key: payload[key] for key in ANALYSIS_REQUIRED_KEYS}
 
 
-def analyze_document_text(document_text: str, model: str | None = None) -> dict:
+def analyze_document_text(
+    document_text: str,
+    model: str | None = None,
+    research_context: str = "",
+    language: str = "en",
+) -> dict:
     """Run the analysis and return the validated result dict.
 
     `model` is optional; falls back to the PROSEPRO_MODEL env var, then the
     default model. Omitting it keeps /analyze behavior identical to before.
+    `research_context` (from app.research) is appended to the prompt when
+    the research layer retrieved live sources; empty keeps the old prompt.
+    `language` is a launch-set code (app.lang); non-English makes every
+    JSON string value come back in that language.
     """
-    prompt = build_prompt(document_text)
+    prompt = build_prompt(document_text, research_context, language)
     # Cloud path (e.g. Hugging Face Space): ANTHROPIC_API_KEY is set, so call
     # the Anthropic API directly instead of shelling out to the sandbox-only
     # CLI, which does not exist on the Space.
@@ -497,6 +969,8 @@ INFORMATION ONLY — never a lawyer, never legal advice. Output is strict
 JSON with a fixed contract so thin clients can render it.
 """
 
+import re
+
 
 # Endpoint-facing alias; same shared service exception underneath.
 DraftError = AIServiceError
@@ -511,8 +985,17 @@ def build_draft_prompt(
     court: str,
     facts: str | None,
     language: str,
+    research_context: str = "",
 ) -> str:
     facts_block = facts.strip() if facts and facts.strip() else "(none provided)"
+    research_block = (
+        f"\n{research_context}\n"
+        "- Authorities listed in the RETRIEVED RESEARCH above MAY be cited "
+        "by the name and citation exactly as given there. Do not extend, "
+        "re-number, or embellish them.\n"
+        if research_context
+        else ""
+    )
 
     def _lines(values) -> str:
         if not values:
@@ -528,8 +1011,12 @@ def build_draft_prompt(
         "anything anywhere; this is a DRAFT only.\n\n"
         f"Draft the following document. OBJECTIVE: {objective}\n"
         f"Jurisdiction: {jurisdiction_state}. Court: {court}.\n"
-        f"Language: write the entire draft in language code '{language}' "
-        "(if the code is not 'en', still keep JSON keys in English).\n\n"
+        f"Language: write the entire draft in {language_name(language)} "
+        f"(language code '{normalize_language(language)}'). Write every "
+        "human-readable string in that language — title, headings, bodies, "
+        "full_text, and needs_user_input — and keep JSON keys in English. "
+        "Party names, captions, case numbers, and citations stay exactly "
+        "as given in the inputs.\n\n"
         "ANALYSIS OF THE SOURCE DOCUMENT:\n"
         f"Document type: {analysis.get('document_type', '')}\n"
         f"Parties: {_lines(analysis.get('parties', []))}\n"
@@ -537,7 +1024,8 @@ def build_draft_prompt(
         f"Deadlines: {_lines(analysis.get('deadlines', []))}\n"
         f"Weaknesses: {_lines(analysis.get('weaknesses', []))}\n"
         f"Summary: {analysis.get('summary', '')}\n\n"
-        f"USER-SUPPLIED FACTS:\n{facts_block}\n\n"
+        f"USER-SUPPLIED FACTS:\n{facts_block}\n"
+        f"{research_block}\n"
         "RULES:\n"
         "- Never reproduce copyrighted text verbatim. When referring to "
         "published legal sources, cite them by name and edition only "
@@ -653,10 +1141,12 @@ def draft_document(
     facts: str | None = None,
     language: str = "en",
     model: str | None = None,
+    research_context: str = "",
 ) -> dict:
     """Generate a draft document; returns the validated draft dict."""
     prompt = build_draft_prompt(
-        analysis, objective, jurisdiction_state, court, facts, language
+        analysis, objective, jurisdiction_state, court, facts, language,
+        research_context,
     )
     raw = run_prompt(prompt, model=resolve_model(model))
     return _validate_draft(parse_json_response(raw, DRAFT_REQUIRED_KEYS, "draft"))
@@ -678,6 +1168,8 @@ General-information framing is repeated in both prompts; nothing here is
 legal advice.
 """
 
+import re
+
 
 # Endpoint-facing alias; same shared service exception underneath.
 AdversaryError = AIServiceError
@@ -696,6 +1188,10 @@ CATEGORIES = {
 }
 STATUSES = {"fixed", "needs_user_input", "not_applicable"}
 
+# The ONLY kinds of change the harden step is allowed to make. There is
+# deliberately no "new fact" category: a change is a restructure of existing
+# material, a citation/argument-framing change, or a placeholder for a fact
+# the user must supply.
 CHANGE_TYPES = {"RESTRUCTURE", "CITATION", "PLACEHOLDER"}
 
 DISCLAIMER_LINE = (
@@ -717,19 +1213,18 @@ GENERAL_FRAME = (
     "it is used. This is a DRAFT exercise; nothing is filed or sent."
 )
 
-GENERAL_FRAME = (
-    "You are assisting with a legal drafting exercise. Everything you "
-    "produce is GENERAL LEGAL INFORMATION ONLY — you are not a lawyer, "
-    "this is not legal advice, no attorney-client relationship is created, "
-    "and a licensed attorney should review any resulting document before "
-    "it is used. This is a DRAFT exercise; nothing is filed or sent."
-)
-
 
 def build_attack_prompt(
-    draft_text: str, adversary_role: str, jurisdiction_state: str, court: str
+    draft_text: str,
+    adversary_role: str,
+    jurisdiction_state: str,
+    court: str,
+    language: str = "en",
 ) -> str:
+    lang_block = language_instruction(language)
+    lang_prefix = f"{lang_block}\n\n" if lang_block else ""
     return (
+        f"{lang_prefix}"
         f"{GENERAL_FRAME}\n\n"
         f"You are now role-playing as the ADVERSE party: {adversary_role}. "
         f"Your job is to attack the draft below as that adversary would in "
@@ -798,14 +1293,17 @@ def attack_draft(
     jurisdiction_state: str,
     court: str,
     model: str | None = None,
+    language: str = "en",
 ) -> dict:
     """Run one adversary round; returns the validated attack dict."""
-    prompt = build_attack_prompt(draft_text, adversary_role, jurisdiction_state, court)
+    prompt = build_attack_prompt(
+        draft_text, adversary_role, jurisdiction_state, court, language
+    )
     raw = run_prompt(prompt, model=resolve_model(model))
     return _validate_attack(parse_json_response(raw, ATTACK_KEYS, "adversary attack"))
 
 
-def build_harden_prompt(draft_text: str, attack: dict) -> str:
+def build_harden_prompt(draft_text: str, attack: dict, language: str = "en") -> str:
     lines = []
     for i, o in enumerate(attack.get("objections", []), start=1):
         lines.append(
@@ -814,7 +1312,10 @@ def build_harden_prompt(draft_text: str, attack: dict) -> str:
         )
     objections_block = "\n".join(lines) if lines else "(none)"
 
+    lang_block = language_instruction(language)
+    lang_prefix = f"{lang_block}\n\n" if lang_block else ""
     return (
+        f"{lang_prefix}"
         f"{GENERAL_FRAME}\n\n"
         "You are now the drafter again. Revise the draft below to address "
         "EACH of the adversary's objections, one by one. Then report exactly "
@@ -871,6 +1372,8 @@ def build_harden_prompt(draft_text: str, attack: dict) -> str:
         "otherwise). No markdown, no code fences, no commentary outside "
         "the JSON object."
     )
+
+
 def _validate_hardened(payload: dict) -> dict:
     revised = payload["revised_draft"]
     if not isinstance(revised, dict):
@@ -1188,7 +1691,11 @@ def _guard_sentences(text: str, sup: dict, flags: list[str]) -> str:
 
 
 def guard_unverified_specifics(
-    revised_draft: dict, hardening_report: list, draft_text: str, attack: dict
+    revised_draft: dict,
+    hardening_report: list,
+    draft_text: str,
+    attack: dict,
+    disclaimer_line: str = DISCLAIMER_LINE,
 ) -> tuple[dict, list, list[str]]:
     """Strip every concrete specific in the hardened output that the inputs
     do not support. Returns (revised_draft, hardening_report, flags)."""
@@ -1211,9 +1718,9 @@ def guard_unverified_specifics(
         ],
         "full_text": clean(revised_draft.get("full_text", "")),
     }
-    if DISCLAIMER_LINE not in revised["full_text"]:
+    if disclaimer_line not in revised["full_text"]:
         revised["full_text"] = (
-            revised["full_text"].rstrip() + "\n\n" + DISCLAIMER_LINE
+            revised["full_text"].rstrip() + "\n\n" + disclaimer_line
         )
 
     report = []
@@ -1233,23 +1740,30 @@ def guard_unverified_specifics(
 
 
 def harden_draft(
-    draft_text: str, attack: dict, model: str | None = None
+    draft_text: str,
+    attack: dict,
+    model: str | None = None,
+    language: str = "en",
 ) -> dict:
     """Revise a draft against an attack; returns revised_draft +
     hardening_report + unverified_additions (specifics the guard stripped
     because the inputs did not support them)."""
-    prompt = build_harden_prompt(draft_text, attack)
+    language = normalize_language(language)
+    prompt = build_harden_prompt(draft_text, attack, language)
     raw = run_prompt(prompt, model=resolve_model(model))
     result = _validate_hardened(parse_json_response(raw, REVISED_KEYS, "hardening"))
     revised, report, flags = guard_unverified_specifics(
-        result["revised_draft"], result["hardening_report"], draft_text, attack
+        result["revised_draft"],
+        result["hardening_report"],
+        draft_text,
+        attack,
+        disclaimer_line=disclaimer_for(language),
     )
     return {
         "revised_draft": revised,
         "hardening_report": report,
         "unverified_additions": flags,
     }
-
 
 # ============================================================
 # module: main.py (flattened)
@@ -1262,11 +1776,12 @@ Exposes:
   POST /draft            - draft a motion/response from an analysis + objective
   POST /adversary/round  - adversary attacks the draft (round N+1, cap 10)
   POST /adversary/harden - revise the draft against the last attack + hardening report
+  POST /research         - live legal research (CourtListener, Cornell LII, web)
 
 Round history is persisted per session under server/data/ (see app/sessions.py).
 All AI output is general legal information only — never legal advice.
 """
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
 
 MAX_CHARS = 60_000
@@ -1335,12 +1850,38 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/research")
+async def do_research(request: Request) -> dict:
+    """Live legal research across keyless public sources.
+
+    Body: {query, jurisdiction?, language?}
+    Returns retrieved sources (CourtListener case law, Cornell LII
+    statutes/definitions, and general web results) with titles,
+    citations, URLs, and snippets. Retrieval is best-effort: when every
+    source is unreachable the result list is simply empty. Retrieved
+    sources are returned in their original language; `language` selects
+    the response disclaimer language and is echoed back for the client.
+    """
+    body = await _json_body(request)
+    query = _require_str(body, "query")
+    jurisdiction = _optional_str(body, "jurisdiction")
+    language = normalize_language(_optional_str(body, "language", default="en"))
+    try:
+        data = research(query, jurisdiction)
+    except ResearchError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {**data, "language": language, "disclaimer": disclaimer_for(language)}
+
+
 @app.post("/analyze")
-def analyze(file: UploadFile = File(...)) -> dict:
+def analyze(file: UploadFile = File(...), language: str = Form("en")) -> dict:
     """Analyze an uploaded legal document.
 
     Form field name must be "file". Accepts .pdf, .docx, .txt.
+    Optional form field "language" (launch-set code, default "en") makes
+    the analysis come back in that language.
     """
+    language = normalize_language(language)
     filename = (file.filename or "").strip()
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
@@ -1369,10 +1910,28 @@ def analyze(file: UploadFile = File(...)) -> dict:
     if truncated:
         text = text[:MAX_CHARS]
 
+    # Research layer: seed the analysis prompt with live sources keyed to
+    # the file name when it carries topical words; retrieval failure just
+    # leaves the prompt on model knowledge (research_context returns "").
+    seed = filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
+    context = research_context(seed) if len(seed) >= 4 and seed.lower() != "document" else ""
+
     try:
-        result = analyze_document_text(text)
+        result = analyze_document_text(
+            text, research_context=context, language=language
+        )
     except AnalysisError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+    # Also return retrieved sources on the document's topic so the client
+    # can show them; best-effort and additive (older clients ignore it).
+    topic = result["document_type"]
+    if result["key_claims"]:
+        topic = f"{topic} {result['key_claims'][0]}"
+    try:
+        found = research(topic)["results"]
+    except Exception:
+        found = []
 
     return {
         "filename": filename,
@@ -1382,7 +1941,9 @@ def analyze(file: UploadFile = File(...)) -> dict:
         "deadlines": result["deadlines"],
         "weaknesses": result["weaknesses"],
         "summary": result["summary"],
-        "disclaimer": DISCLAIMER,
+        "research": found,
+        "language": language,
+        "disclaimer": disclaimer_for(language),
         "truncated": truncated,
     }
 
@@ -1428,7 +1989,7 @@ async def create_draft(request: Request) -> dict:
     jurisdiction_state = _require_str(body, "jurisdiction_state")
     court = _require_str(body, "court")
     facts = _optional_str(body, "facts")
-    language = _optional_str(body, "language", default="en") or "en"
+    language = normalize_language(_optional_str(body, "language", default="en"))
     model = _optional_str(body, "model")
 
     raw_session_id = body.get("session_id")
@@ -1439,6 +2000,11 @@ async def create_draft(request: Request) -> dict:
             status_code=400, detail="'session_id' must be a non-empty string."
         )
 
+    # Research layer: pull live sources on the objective for this
+    # jurisdiction and hand them to the drafting prompt; empty string on
+    # any retrieval failure (draft then relies on model knowledge).
+    context = research_context(objective, jurisdiction_state)
+
     try:
         draft = draft_document(
             analysis=analysis,
@@ -1448,6 +2014,7 @@ async def create_draft(request: Request) -> dict:
             facts=facts,
             language=language,
             model=model,
+            research_context=context,
         )
     except DraftError as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -1472,7 +2039,7 @@ async def create_draft(request: Request) -> dict:
     return {
         "session_id": session["session_id"],
         "draft": draft,
-        "disclaimer": DISCLAIMER,
+        "disclaimer": disclaimer_for(language),
         "round": 0,
     }
 
@@ -1509,6 +2076,9 @@ async def adversary_round(request: Request) -> dict:
         request_id = request_id.strip() or None
 
     session = get_or_create(session_id)
+    language = normalize_language(
+        _optional_str(body, "language") or session.get("language") or "en"
+    )
 
     if request_id:
         for event in session.get("events", []):
@@ -1519,7 +2089,7 @@ async def adversary_round(request: Request) -> dict:
                     "session_id": session["session_id"],
                     "round": event["round"],
                     "attack": event["data"]["attack"],
-                    "disclaimer": DISCLAIMER,
+                    "disclaimer": disclaimer_for(language),
                 }
 
     next_round = session["round"] + 1
@@ -1535,12 +2105,14 @@ async def adversary_round(request: Request) -> dict:
             jurisdiction_state=jurisdiction_state,
             court=court,
             model=model,
+            language=language,
         )
     except AdversaryError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
     session["jurisdiction_state"] = jurisdiction_state
     session["court"] = court
+    session["language"] = language
     session["model"] = model
     add_event(
         session,
@@ -1557,7 +2129,7 @@ async def adversary_round(request: Request) -> dict:
         "session_id": session["session_id"],
         "round": next_round,
         "attack": attack,
-        "disclaimer": DISCLAIMER,
+        "disclaimer": disclaimer_for(language),
     }
 
 
@@ -1592,9 +2164,14 @@ async def adversary_harden(request: Request) -> dict:
             detail="No adversary round has been run for this session yet; "
             "call /adversary/round first.",
         )
+    language = normalize_language(
+        _optional_str(body, "language") or session.get("language") or "en"
+    )
 
     try:
-        result = harden_draft(draft_text=draft_text, attack=attack, model=model)
+        result = harden_draft(
+            draft_text=draft_text, attack=attack, model=model, language=language
+        )
     except AdversaryError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -1616,5 +2193,5 @@ async def adversary_harden(request: Request) -> dict:
         "revised_draft": result["revised_draft"],
         "hardening_report": result["hardening_report"],
         "unverified_additions": unverified,
-        "disclaimer": DISCLAIMER,
+        "disclaimer": disclaimer_for(language),
     }
